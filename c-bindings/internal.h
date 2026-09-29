@@ -47,3 +47,10 @@ void jsonnet_internal_free_string(char *str);
 void jsonnet_internal_free_pointer(void *ptr);
 
 char* jsonnet_internal_realloc(struct JsonnetVm *vm, char *str, size_t sz);
+
+// Returns NULL when Jsonnet can safely be evaluated in the current process, or a
+// static human-readable explanation when the process was created by fork() from
+// a process that had already loaded the library. This must be callable without
+// entering the Go runtime, because entering the Go runtime is precisely the
+// thing that deadlocks in that situation.
+const char* jsonnet_internal_fork_safety_error(void);

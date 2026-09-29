@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 extern "C" {
     void jsonnet_gc_min_objects(struct JsonnetVm *vm, unsigned v);
@@ -108,4 +109,36 @@ char *jsonnet_internal_realloc(JsonnetVm *vm, char *str, size_t sz)
             return r;
         }
     }
+}
+
+// Loading this library starts the Go runtime and its threads, so a process
+// created with fork() afterwards inherits the Go scheduler's state without the
+// threads backing it. The PID is captured here by a library constructor because
+// that is the only point guaranteed to run before the embedding program can
+// fork: the Go runtime starts at load time, but Go *package* initialisation --
+// where a plain Go variable would be assigned -- is deferred until the first
+// call into Go, which in a forked child has already happened.
+static int jsonnet_load_pid = 0;
+
+__attribute__((constructor)) static void jsonnet_capture_load_pid()
+{
+    jsonnet_load_pid = (int)getpid();
+}
+
+const char* jsonnet_internal_fork_safety_error()
+{
+    if (jsonnet_load_pid == 0 || jsonnet_load_pid == (int)getpid()) {
+        return nullptr;
+    }
+    return "go-jsonnet cannot evaluate Jsonnet in this process: it was created "
+           "with fork() from a process which had already initialised the Go "
+           "runtime, and the Go runtime's threads do not survive fork(). "
+           "Evaluation would hang indefinitely with no CPU usage, while the Go "
+           "runtime waits for a stop-the-world garbage collection that can "
+           "never complete. To work around this, either use a start method "
+           "which exec()s a fresh interpreter (multiprocessing \"spawn\"; "
+           "\"forkserver\" is safe only if the forkserver process never imports "
+           "gojsonnet), or perform all Jsonnet evaluation in the parent process "
+           "before forking and pass the results to the children. See "
+           "https://github.com/google/go-jsonnet/issues/484.";
 }

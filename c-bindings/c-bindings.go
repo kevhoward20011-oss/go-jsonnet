@@ -146,7 +146,56 @@ func getVM(vmRef *C.struct_JsonnetVm) *vm {
 	return v
 }
 
+// checkForkSafety returns a non-empty error message if the current process
+// cannot safely evaluate Jsonnet.
+//
+// The Go runtime is multi-threaded and provides no fork() hook, so it cannot
+// notice that it has been duplicated by fork(). A child created from a process
+// which has already initialised the runtime inherits the runtime's scheduler
+// state (GOMAXPROCS, the M/P lists, the GC state) but none of its threads. The
+// first stop-the-world in that child -- which is what the garbage collector
+// does at the start of a cycle, and what evaluating any non-trivial Jsonnet
+// program reliably provokes -- calls stopTheWorld() and then blocks forever in
+// semacquire(&worldsema), waiting for Ms that no longer exist. The process sits
+// at 0% CPU and can only be recovered with SIGKILL.
+//
+// The trigger is not fork() itself but "fork() after the Go runtime is up".
+// This is why the check compares process IDs rather than trying to track fork
+// events: a child created by fork() always has a different PID, and a process
+// created by exec (spawn) starts a fresh Go runtime which records its own PID.
+// The same applies to the forkserver start method, whose helper process imports
+// the caller's __main__ module and can therefore end up initialising the Go
+// runtime before it forks its children. See jsonnet_internal_fork_safety_error
+// in libjsonnet.cpp, which holds the load-time PID and the message, so that
+// this check and the pre-check in the Python binding share one implementation.
+//
+// Note that this guard is a backstop, not the primary defence. Reaching it
+// already means entering the Go runtime, which is itself unsafe in a forked
+// child: on Linux the child can block on the runtime's initialisation
+// semaphore inside jsonnet_make, before any function below is reached. Callers
+// must therefore check jsonnet_internal_fork_safety_error() *before* their
+// first call into Go. The Python binding does this in python/_jsonnet.c, and
+// C callers should do it before jsonnet_make().
+//
+// There is deliberately no attempt at recovery. The Go runtime exposes no way
+// to restart, re-initialise, or reconstruct its threads, so a post-fork child
+// cannot be made usable again from inside this library. Disabling the GC with
+// debug.SetGCPercent(-1) does avoid the stop-the-world, but it only suppresses
+// the trigger: it leaves the scheduler state inconsistent, cannot be undone
+// after the fact, and costs unbounded memory growth in the child. Failing fast
+// with an actionable message is both safer and cheaper than a silent hang.
+func checkForkSafety() string {
+	if msg := C.jsonnet_internal_fork_safety_error(); msg != nil {
+		return C.GoString(msg)
+	}
+	return ""
+}
+
 func evaluateSnippet(vmRef *C.struct_JsonnetVm, filename string, code string, e *C.int) *C.char {
+	if msg := checkForkSafety(); msg != "" {
+		*e = 1
+		return C.CString(msg)
+	}
 	vm := getVM(vmRef)
 	// We still use a deprecated function to keep backwards compatible behavior.
 	//nolint:staticcheck
@@ -163,6 +212,10 @@ func evaluateSnippet(vmRef *C.struct_JsonnetVm, filename string, code string, e 
 }
 
 func evaluateSnippetStream(vmRef *C.struct_JsonnetVm, filename string, code string, e *C.int) *C.char {
+	if msg := checkForkSafety(); msg != "" {
+		*e = 1
+		return C.CString(msg)
+	}
 	vm := getVM(vmRef)
 	// We still use a deprecated function to keep backwards compatible behavior.
 	//nolint:staticcheck
@@ -184,6 +237,10 @@ func evaluateSnippetStream(vmRef *C.struct_JsonnetVm, filename string, code stri
 }
 
 func evaluateSnippetMulti(vmRef *C.struct_JsonnetVm, filename string, code string, e *C.int) *C.char {
+	if msg := checkForkSafety(); msg != "" {
+		*e = 1
+		return C.CString(msg)
+	}
 	vm := getVM(vmRef)
 	// We still use a deprecated function to keep backwards compatible behavior.
 	//nolint:staticcheck
@@ -629,6 +686,10 @@ func jsonnet_fmt_file(vmRef *C.struct_JsonnetVm, filename *C.char, e *C.int) *C.
 }
 
 func formatSnippet(vmRef *C.struct_JsonnetVm, filename string, code string, e *C.int) *C.char {
+	if msg := checkForkSafety(); msg != "" {
+		*e = 1
+		return C.CString(msg)
+	}
 	vm := getVM(vmRef)
 	out, err := formatter.Format(filename, code, vm.formatOptions)
 	var result *C.char

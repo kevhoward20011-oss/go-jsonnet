@@ -21,6 +21,17 @@ limitations under the License.
 
 #include "libjsonnet.h"
 
+/* Defined by the go-jsonnet c-bindings (see c-bindings/libjsonnet.cpp). Returns
+ * NULL when Jsonnet can safely be evaluated in this process, or a static
+ * human-readable explanation when the process was created by fork() from a
+ * process that had already loaded the bindings.
+ *
+ * Declared here rather than added to libjsonnet.h so that the public C API
+ * surface is unchanged. This must be called before any function that enters the
+ * Go runtime -- including jsonnet_make() -- because entering the Go runtime is
+ * itself what deadlocks in a forked child. */
+const char *jsonnet_internal_fork_safety_error(void);
+
 static char *jsonnet_str(struct JsonnetVm *vm, const char *str)
 {
     size_t size = strlen(str) + 1;
@@ -502,6 +513,12 @@ static PyObject* evaluate_file(PyObject* self, PyObject* args, PyObject *keywds)
 
     PyThreadState *py_thread;
 
+    const char *fork_error = jsonnet_internal_fork_safety_error();
+    if (fork_error != NULL) {
+        PyErr_SetString(PyExc_RuntimeError, fork_error);
+        return NULL;
+    }
+
     vm = jsonnet_make();
     jsonnet_max_stack(vm, max_stack);
     jsonnet_gc_min_objects(vm, gc_min_objects);
@@ -591,6 +608,12 @@ static PyObject* evaluate_snippet(PyObject* self, PyObject* args, PyObject *keyw
     }
 
     PyThreadState *py_thread;
+
+    const char *fork_error = jsonnet_internal_fork_safety_error();
+    if (fork_error != NULL) {
+        PyErr_SetString(PyExc_RuntimeError, fork_error);
+        return NULL;
+    }
 
     vm = jsonnet_make();
     jsonnet_max_stack(vm, max_stack);

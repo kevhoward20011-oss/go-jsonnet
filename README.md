@@ -144,6 +144,97 @@ Or if using bazel:
 bazel build //cmd/wasm:libjsonnet.wasm
 ```
 
+## Using the Python or C bindings in a process that forks
+
+**Do not evaluate Jsonnet in a process created with `fork()` after the bindings
+have been loaded.** The bindings raise an error instead of hanging, but you
+should still avoid the situation:
+
+```python
+import multiprocessing as mp
+import _gojsonnet            # loads the library, starting the Go runtime
+
+def work():
+    _gojsonnet.evaluate_file("x.jsonnet")   # RuntimeError: ... created with fork() ...
+
+if __name__ == "__main__":
+    mp.get_context("fork").Process(target=work).start()   # never do this
+```
+
+This applies to the C bindings too, and has been reported as
+[#484](https://github.com/google/go-jsonnet/issues/484).
+
+### Why it deadlocks
+
+Loading the library starts the Go runtime, which immediately spawns several
+threads (measured: a Python process goes from 1 thread to 5 on
+`import _gojsonnet`). `fork()` copies only the calling thread, so the child
+inherits the Go scheduler's state — GOMAXPROCS, the M and P lists, the GC
+state — but none of the threads that are supposed to be driving it. The Go
+runtime has no `fork()` hook and cannot notice this.
+
+The child therefore appears to work at first. It hangs the first time it needs a
+stop-the-world, which is what the garbage collector does at the start of a cycle
+and what evaluating any non-trivial Jsonnet program reliably provokes:
+`stopTheWorld()` waits in `semacquire(&worldsema)` for Ms that no longer exist.
+The result is a process at 0% CPU that can only be recovered with `SIGKILL`.
+
+This is why the symptom scales with output size — a few KB of output finishes
+before the collector's pacer starts a cycle, while a few MB does not. That
+threshold is an artefact of the GC heuristic, not a real limit.
+
+Note that a forked child can also block *before* it reaches any Jsonnet code, on
+the Go runtime's own initialisation semaphore. On Linux this is reproducible:
+`gdb` shows the child parked on a futex at `runtime_init_cond`, inside
+`jsonnet_make()`, with a single thread and zero CPU time. Any Go call is
+potentially fatal in a forked child, so the check below has to run before the
+first call into Go, not merely before evaluating something.
+
+### Why there is no transparent fix
+
+The Go runtime exposes no supported way to restart, re-initialise, or recreate
+its threads, so a post-fork child cannot be made usable again from inside the
+library. Recovery is limited to detection.
+
+Disabling the collector with `debug.SetGCPercent(-1)` does avoid the
+stop-the-world, but it is a mitigation rather than a fix: it only suppresses the
+trigger, leaves the scheduler state inconsistent, cannot be undone afterwards,
+and costs unbounded memory growth in the child. Failing fast is safer and
+cheaper than trading a hang for silent memory exhaustion.
+
+The detection is shared between the C and Python bindings
+(`jsonnet_internal_fork_safety_error` in `c-bindings/libjsonnet.cpp`). It
+compares the current PID against the one recorded by a library constructor at
+load time, because the Go runtime starts at load time while Go *package*
+initialisation is deferred until the first call into Go — which, in this
+scenario, has already happened inside the forked child. C callers must invoke it
+before their first call into the library, including `jsonnet_make()`; the Python
+binding does this for you.
+
+The bindings therefore detect the condition and report it.
+
+### Recommended safe usage
+
+* Use `multiprocessing` start method **`spawn`**, which `exec`s a fresh
+  interpreter and is therefore always safe. It is already the default on macOS
+  and the default on Windows; on Linux you must opt in with
+  `mp.set_start_method("spawn")` or `mp.get_context("spawn")`.
+* **`forkserver` is only safe if the forkserver process never loads the
+  bindings.** It forks its children from a helper process, and `multiprocessing`
+  preloads your `__main__` module into that helper — so a module-level
+  `import _gojsonnet` makes `forkserver` just as unsafe as `fork`. It is safe
+  when the import is deferred into the function that needs it.
+* Or **do all Jsonnet evaluation in the parent, before forking**, and pass the
+  results to the children. This is often the simplest fix, since Jsonnet is
+  usually CPU-bound and the workers are doing the I/O.
+
+A minimal, dependency-free way to diagnose an existing hang is to check whether
+the wedged process has a single thread:
+
+```bash
+sample $(pgrep -f your_app) 3 -f /tmp/app.sample   # look for one Thread_ in the call graph
+```
+
 ## Running tests
 
 ```bash
