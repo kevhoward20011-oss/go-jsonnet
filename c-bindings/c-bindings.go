@@ -169,13 +169,20 @@ func getVM(vmRef *C.struct_JsonnetVm) *vm {
 // in libjsonnet.cpp, which holds the load-time PID and the message, so that
 // this check and the pre-check in the Python binding share one implementation.
 //
-// Note that this guard is a backstop, not the primary defence. Reaching it
+// Note that these guards are backstops, not the primary defence. Reaching one
 // already means entering the Go runtime, which is itself unsafe in a forked
-// child: on Linux the child can block on the runtime's initialisation
-// semaphore inside jsonnet_make, before any function below is reached. Callers
-// must therefore check jsonnet_internal_fork_safety_error() *before* their
-// first call into Go. The Python binding does this in python/_jsonnet.c, and
-// C callers should do it before jsonnet_make().
+// child. If the library was loaded but never called into before the fork, the
+// child's first call blocks in cgo's runtime-initialisation wait and no Go code
+// runs at all. If the parent had already called into the library, that wait
+// returns and the child instead hangs at the first allocation large enough to
+// start a garbage collection cycle. Both have been reproduced on linux/amd64 and
+// on darwin/arm64, so neither is specific to Linux.
+//
+// Callers must therefore check jsonnet_internal_fork_safety_error() *before*
+// their first call into Go. The Python binding does this in python/_jsonnet.c,
+// which is what keeps evaluate_file safe: jsonnet_evaluate_file reads the whole
+// file before reaching any guard below, so a large enough file hangs there.
+// C callers should do the same before jsonnet_make().
 //
 // There is deliberately no attempt at recovery. The Go runtime exposes no way
 // to restart, re-initialise, or reconstruct its threads, so a post-fork child

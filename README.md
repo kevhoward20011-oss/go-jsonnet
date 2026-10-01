@@ -146,23 +146,25 @@ bazel build //cmd/wasm:libjsonnet.wasm
 
 ## Using the Python or C bindings in a process that forks
 
-**Do not evaluate Jsonnet in a process created with `fork()` after the bindings
-have been loaded.** The bindings raise an error instead of hanging, but you
-should still avoid the situation:
+Evaluating Jsonnet in a process created with `fork()` after the bindings have
+been loaded used to hang forever. The Go runtime cannot be repaired in place, so
+the Python bindings now **hand the evaluation to a helper process started with
+`exec`**, whose Go runtime is sound. You should still prefer to avoid the
+situation, because the helper costs a process per evaluation:
 
 ```python
 import multiprocessing as mp
 import _gojsonnet            # loads the library, starting the Go runtime
 
 def work():
-    _gojsonnet.evaluate_file("x.jsonnet")   # RuntimeError: ... created with fork() ...
+    _gojsonnet.evaluate_file("x.jsonnet")   # runs in a helper process
 
 if __name__ == "__main__":
-    mp.get_context("fork").Process(target=work).start()   # never do this
+    mp.get_context("fork").Process(target=work).start()   # works, but see below
 ```
 
-This applies to the C bindings too, and has been reported as
-[#484](https://github.com/google/go-jsonnet/issues/484).
+This applies to the C bindings too, which have no such recovery, and has been
+reported as [#484](https://github.com/google/go-jsonnet/issues/484).
 
 ### Why it deadlocks
 
@@ -211,7 +213,48 @@ scenario, has already happened inside the forked child. C callers must invoke it
 before their first call into the library, including `jsonnet_make()`; the Python
 binding does this for you.
 
-The bindings therefore detect the condition and report it.
+### How the Python bindings recover
+
+The Go runtime itself cannot be repaired, so the Python bindings do not try. When
+`evaluate_file` or `evaluate_snippet` is called in an unsafe post-fork process,
+the request is handed to a **helper process started with `exec`**
+(`python/_forkexec.py`). That process loads the bindings for the first time, so
+its Go runtime is initialised after the `exec` and is sound. The request and the
+result travel through temporary files; the forked child never enters the Go
+runtime itself.
+
+Arguments are forwarded unchanged, so `ext_vars`, `ext_codes`, `tla_vars`,
+`tla_codes`, `jpathdir`, `max_stack`, the GC settings and error messages all
+behave as they do in a normal process. If the helper cannot be started, cannot be
+spawned, or does not answer within `GOJSONNET_FORKEXEC_TIMEOUT` seconds (default
+120), the call raises a `RuntimeError` — it never falls back to evaluating in the
+unsafe process.
+
+This is not yet used for the C API, which has no way to be handed a subprocess;
+C callers should keep calling `jsonnet_internal_fork_safety_error` first.
+
+### Callbacks in a delegated evaluation
+
+`import_callback` and `native_callbacks` are Python callables and do not cross a
+process boundary, so by default passing them to a delegated evaluation raises a
+`RuntimeError`. Set **`GOJSONNET_FORKEXEC_CALLBACKS=1`** to enable them: the
+forked process then opens a local `AF_UNIX` socket, and the helper calls back
+into it for every import and native call. The callback bodies stay in the
+process that called `evaluate_*`.
+
+Two consequences, both deliberate:
+
+* `os.getpid()` seen inside a callback is unchanged — it is the process that
+  called `evaluate_*`.
+* **The callback runs on a broker thread, not the Python thread that called
+  `evaluate_*`.** `threading.get_ident()` and `threading.get_native_id()` will
+  therefore differ from the caller's. Do not use thread-local state, or assert on
+  the calling thread, from a callback in this mode.
+* Each import/native call costs a socket round trip, so callback-heavy programs
+  are slower than in a normal process.
+
+If the socket cannot be created the evaluation fails; it never falls back to
+evaluating in the unsafe process.
 
 ### Recommended safe usage
 

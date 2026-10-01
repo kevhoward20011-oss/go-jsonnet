@@ -32,6 +32,75 @@ limitations under the License.
  * itself what deadlocks in a forked child. */
 const char *jsonnet_internal_fork_safety_error(void);
 
+/* Reports whether this process was created by fork() after the bindings were
+ * loaded, i.e. whether calling into the Go runtime here is unsafe.
+ *
+ * This is exposed so that a caller which wants to evaluate Jsonnet somewhere
+ * else -- for example a helper process started with exec() -- can decide
+ * correctly. Deriving the same answer in Python is not safe: multiprocessing's
+ * forkserver preload silently ignores modules it cannot import, so a helper
+ * module may be imported for the first time *inside* a forked child, which
+ * would record the child's own pid and wrongly conclude it is safe. The pid
+ * compared here is captured by a library constructor at load time, so it is
+ * already correct before any Python code runs. */
+static PyObject* is_post_fork(PyObject* self, PyObject* noargs)
+{
+    (void) self;
+    (void) noargs;
+    if (jsonnet_internal_fork_safety_error() != NULL) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+/* Hands the call over to a helper process started with exec(), which has a
+ * Go runtime initialised after the exec and is therefore sound.
+ *
+ * args and keywds are forwarded untouched so that argument parsing, defaults
+ * and error messages are identical to a direct call. If the helper module is
+ * unavailable -- for example in a wheel that does not ship it -- fall back to
+ * reporting the fork-safety error rather than failing in some new way. */
+static PyObject* forkexec_delegate(const char *op, PyObject *args, PyObject *keywds,
+                                   const char *fallback_error)
+{
+    PyObject *module, *func, *op_str, *call_args, *result;
+
+    module = PyImport_ImportModule("_forkexec");
+    if (module == NULL) {
+        PyErr_Clear();
+        PyErr_SetString(PyExc_RuntimeError, fallback_error);
+        return NULL;
+    }
+    func = PyObject_GetAttrString(module, "delegate");
+    Py_DECREF(module);
+    if (func == NULL) {
+        PyErr_Clear();
+        PyErr_SetString(PyExc_RuntimeError, fallback_error);
+        return NULL;
+    }
+    op_str = PyUnicode_FromString(op);
+    if (op_str == NULL) {
+        Py_DECREF(func);
+        return NULL;
+    }
+    /* delegate(op, args, keywds). PyObject_CallObject takes a tuple whose
+     * third element, when present, must be the keyword-argument dict. */
+    if (keywds == NULL) {
+        call_args = Py_BuildValue("(OOO)", op_str, args, Py_None);
+    } else {
+        call_args = Py_BuildValue("(OOO)", op_str, args, keywds);
+    }
+    Py_DECREF(op_str);
+    if (call_args == NULL) {
+        Py_DECREF(func);
+        return NULL;
+    }
+    result = PyObject_CallObject(func, call_args);
+    Py_DECREF(call_args);
+    Py_DECREF(func);
+    return result;
+}
+
 static char *jsonnet_str(struct JsonnetVm *vm, const char *str)
 {
     size_t size = strlen(str) + 1;
@@ -515,8 +584,7 @@ static PyObject* evaluate_file(PyObject* self, PyObject* args, PyObject *keywds)
 
     const char *fork_error = jsonnet_internal_fork_safety_error();
     if (fork_error != NULL) {
-        PyErr_SetString(PyExc_RuntimeError, fork_error);
-        return NULL;
+        return forkexec_delegate("file", args, keywds, fork_error);
     }
 
     vm = jsonnet_make();
@@ -611,8 +679,7 @@ static PyObject* evaluate_snippet(PyObject* self, PyObject* args, PyObject *keyw
 
     const char *fork_error = jsonnet_internal_fork_safety_error();
     if (fork_error != NULL) {
-        PyErr_SetString(PyExc_RuntimeError, fork_error);
-        return NULL;
+        return forkexec_delegate("snippet", args, keywds, fork_error);
     }
 
     vm = jsonnet_make();
@@ -673,6 +740,8 @@ static PyMethodDef module_methods[] = {
      "Interpret the given Jsonnet file."},
     {"evaluate_snippet", (PyCFunction)evaluate_snippet, METH_VARARGS | METH_KEYWORDS,
      "Interpret the given Jsonnet code."},
+    {"is_post_fork", (PyCFunction)is_post_fork, METH_NOARGS,
+     "True if this process was created by fork() after the bindings were loaded."},
     {NULL, NULL, 0, NULL}
 };
 

@@ -63,6 +63,7 @@ jsonnet_ext = Extension(
 
 setup(
     name="gojsonnet",
+    py_modules=["_forkexec", "_forkexec_worker"],
     url="https://jsonnet.org",
     description="Python bindings for Jsonnet - The data templating language ",
     author="David Cunningham",
